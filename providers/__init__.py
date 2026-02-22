@@ -75,6 +75,10 @@ class StorageProvider(Protocol):
         """Return base-names that already have transcripts."""
         ...
 
+    def get_folder_name(self, service: Any, folder_ref: str) -> str:
+        """Return the display name of a folder given its ref/ID/URL."""
+        ...
+
 
 def detect_provider(url_or_ref: str) -> str:
     """Auto-detect provider name from a URL or reference string.

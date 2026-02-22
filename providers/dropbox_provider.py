@@ -389,6 +389,17 @@ class DropboxProvider:
                 pass  # May already exist due to race
         return folder_path
 
+    def get_folder_name(self, service, folder_ref: str) -> str:
+        """Return the display name of the folder.
+
+        For shared links, resolves via the sharing API.
+        For bare paths, returns the last path component.
+        """
+        if folder_ref.startswith("https://"):
+            meta = service.sharing_get_shared_link_metadata(folder_ref)
+            return meta.name
+        return Path(folder_ref.rstrip("/")).name or folder_ref
+
     def list_existing_transcripts(self, service, folder_path: str) -> set[str]:
         """Return base-names that already have transcripts."""
         names: set[str] = set()

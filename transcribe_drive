@@ -220,6 +220,13 @@ def build_transcript_header(file_meta: dict, duration_secs: float) -> str:
     return "\n".join(lines)
 
 
+def sanitize_name(name: str) -> str:
+    """Turn a folder name into a safe subfolder component."""
+    # Replace any character that isn't alphanumeric, dash, underscore, or dot
+    safe = re.sub(r"[^\w.\-]", "_", name)
+    return safe.strip("_") or "job"
+
+
 def resolve_provider(args):
     """Determine the provider from --source flag or auto-detect from the folder/file arg."""
     source = getattr(args, "source", None)
@@ -370,26 +377,30 @@ def cmd_transcribe(args):
 
     print(f"\nProcessing: {file_meta['name']} ({format_size(file_meta.get('size', 0))})")
 
-    # Create output subfolders if output folder specified
+    # Create a job-specific output subfolder to avoid conflicts with concurrent jobs
     transcript_folder_id = None
     audio_folder_id = None
+    job_folder_id = None
     if output_folder_id:
-        transcript_folder_id = provider.ensure_subfolder(service, output_folder_id, "transcripts")
-        audio_folder_id = provider.ensure_subfolder(service, output_folder_id, "audio")
+        src_name = sanitize_name(provider.get_folder_name(service, file_id))
+        job_folder_id = provider.ensure_subfolder(service, output_folder_id, src_name)
+        print(f"Output subfolder: {src_name}")
+        transcript_folder_id = provider.ensure_subfolder(service, job_folder_id, "transcripts")
+        audio_folder_id = provider.ensure_subfolder(service, job_folder_id, "audio")
 
     tmp_dir = Path("/tmp/transcribe_drive")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_entry, actual_cost, duration, usage = process_single_file(
         provider, service, gemini, file_meta,
-        transcript_folder_id, audio_folder_id, output_folder_id, tmp_dir,
+        transcript_folder_id, audio_folder_id, job_folder_id, tmp_dir,
     )
 
-    # Update manifest on Drive if output folder specified
-    if output_folder_id:
-        manifest, manifest_file_id = provider.load_manifest(service, output_folder_id)
+    # Update manifest in job subfolder
+    if job_folder_id:
+        manifest, manifest_file_id = provider.load_manifest(service, job_folder_id)
         manifest["files"].append(manifest_entry)
-        provider.save_manifest(service, output_folder_id, manifest, manifest_file_id)
+        provider.save_manifest(service, job_folder_id, manifest, manifest_file_id)
         print(f"  Manifest updated")
 
     return manifest_entry
@@ -406,8 +417,14 @@ def cmd_batch(args):
     budget = args.budget
 
     print(f"Source folder: {folder_ref}")
+
+    # Create a job-specific output subfolder named after the source folder
+    # so concurrent jobs writing to the same output root don't collide.
+    job_folder_id = None
     if output_folder_id:
-        print(f"Output folder: {output_folder_id}")
+        src_name = sanitize_name(provider.get_folder_name(service, folder_ref))
+        job_folder_id = provider.ensure_subfolder(service, output_folder_id, src_name)
+        print(f"Output subfolder: {src_name}/ (in {output_folder_id})")
 
     # List source files
     files = provider.list_video_files(service, folder_ref)
@@ -423,10 +440,10 @@ def cmd_batch(args):
     transcribed_ids = set()
     transcript_folder_id = None
     audio_folder_id = None
-    if output_folder_id:
-        transcript_folder_id = provider.ensure_subfolder(service, output_folder_id, "transcripts")
-        audio_folder_id = provider.ensure_subfolder(service, output_folder_id, "audio")
-        manifest, manifest_file_id = provider.load_manifest(service, output_folder_id)
+    if job_folder_id:
+        transcript_folder_id = provider.ensure_subfolder(service, job_folder_id, "transcripts")
+        audio_folder_id = provider.ensure_subfolder(service, job_folder_id, "audio")
+        manifest, manifest_file_id = provider.load_manifest(service, job_folder_id)
         manifest["source_folder_id"] = folder_ref
         transcribed_ids = {e["source_file_id"] for e in manifest.get("files", [])}
         if transcribed_ids:
@@ -467,7 +484,7 @@ def cmd_batch(args):
         try:
             manifest_entry, file_cost, duration, usage = process_single_file(
                 provider, service, gemini, f,
-                transcript_folder_id, audio_folder_id, output_folder_id, tmp_dir,
+                transcript_folder_id, audio_folder_id, job_folder_id, tmp_dir,
             )
 
             total_cost += file_cost
@@ -486,7 +503,7 @@ def cmd_batch(args):
             if manifest is not None:
                 manifest["files"].append(manifest_entry)
                 manifest_file_id = provider.save_manifest(
-                    service, output_folder_id, manifest, manifest_file_id
+                    service, job_folder_id, manifest, manifest_file_id
                 )
                 print(f"  → Manifest updated ({len(manifest['files'])} entries)")
 
