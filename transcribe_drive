@@ -1,0 +1,898 @@
+#!/usr/bin/env python3
+"""Google Drive .mov → diarized transcription via Gemini.
+
+Downloads .mov files from Google Drive, extracts audio with ffmpeg,
+transcribes with speaker diarization via Gemini 2.5 Flash, and uploads
+transcripts + mp3s back to Drive.
+
+Uses Application Default Credentials (ADC) for Drive access.
+Requires GEMINI_API_KEY in ~/bin/transcribe.env.
+
+Usage:
+    transcribe_drive list <folder_url_or_id>
+    transcribe_drive transcribe <file_id> [--output-folder DRIVE_FOLDER_ID]
+    transcribe_drive batch <folder_url_or_id> [--output-folder DRIVE_FOLDER_ID] [--budget DOLLARS]
+"""
+import sys
+import os
+import subprocess
+import shutil
+import time
+import re
+import argparse
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+# --- VIRTUAL ENVIRONMENT BOOTSTRAP ---
+script_path = Path(__file__).resolve()
+script_dir = script_path.parent
+script_stem = script_path.stem
+venv_dir = script_dir / f".{script_stem}_venv"
+venv_python = venv_dir / "bin" / "python"
+
+REQUIREMENTS = [
+    "google-genai",
+    "google-auth",
+    "google-auth-oauthlib",
+    "google-api-python-client",
+    "python-dotenv",
+]
+
+if not venv_dir.exists():
+    print(f"Creating virtual environment at {venv_dir}...")
+    subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+    subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "-U", "pip"] + REQUIREMENTS,
+        check=True,
+    )
+
+if sys.executable != str(venv_python):
+    os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+
+# --- IMPORTS AFTER BOOTSTRAP ---
+from dotenv import load_dotenv
+from google import genai
+from google.auth.transport.requests import Request as AuthRequest
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build as build_service
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+import io
+
+load_dotenv(script_dir / "transcribe.env")
+
+# --- CONSTANTS ---
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
+]
+MOV_MIME_TYPES = [
+    "video/quicktime",
+    "video/mp4",
+    "video/x-msvideo",
+    "video/x-matroska",
+]
+GEMINI_MODEL = "gemini-2.5-pro"
+# Gemini 2.5 Pro pricing (per 1M tokens)
+PRICE_INPUT_PER_M = 1.25
+PRICE_OUTPUT_PER_M = 10.00
+# Rough estimate: ~32 tokens/sec of audio for Gemini
+TOKENS_PER_SEC = 32
+
+DIARIZATION_PROMPT = """\
+Transcribe this audio with speaker diarization.
+
+Rules:
+- Identify each unique speaker and label them consistently (Speaker 1, Speaker 2, etc.).
+- If you can identify a speaker by name from context clues (e.g. someone addresses them \
+by name, or they introduce themselves), include their name in parentheses after the \
+speaker label, like: Speaker 1 (Tim Draper):
+- Once you identify a speaker's name, use it consistently for all their subsequent turns.
+- Include timestamps at the start of each speaker turn in [MM:SS] format, relative to \
+the start of the audio.
+- Output as plain text, one speaker turn per line.
+- Do not omit any speech. Transcribe everything spoken.
+- If multiple people talk at once, transcribe the dominant speaker and note crosstalk in \
+parentheses if significant.
+
+Format each line as:
+[MM:SS] Speaker N (Name if known): What they said...
+"""
+
+
+# --- HELPERS ---
+
+def extract_folder_id(folder_ref: str) -> str:
+    """Extract a Google Drive folder ID from a URL or bare ID."""
+    # Match URLs like https://drive.google.com/drive/folders/FOLDER_ID
+    m = re.search(r"folders/([a-zA-Z0-9_-]+)", folder_ref)
+    if m:
+        return m.group(1)
+    # Match URLs with id= parameter
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", folder_ref)
+    if m:
+        return m.group(1)
+    # Assume bare ID
+    return folder_ref.strip()
+
+
+def get_drive_service():
+    """Build an authenticated Drive API service using OAuth client credentials."""
+    client_secret = script_dir / "transcribe_client_secret.json"
+    token_path = script_dir / ".transcribe_drive_token.json"
+    creds = None
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(AuthRequest())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(client_secret), SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+        token_path.write_text(creds.to_json())
+    return build_service("drive", "v3", credentials=creds)
+
+
+def get_gemini_client():
+    """Build a Gemini API client."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("ERROR: GEMINI_API_KEY not set. Check ~/bin/transcribe.env")
+        sys.exit(1)
+    return genai.Client(
+        api_key=api_key,
+        http_options={"timeout": 600_000},  # 10 min timeout for long transcriptions
+    )
+
+
+def list_video_files(service, folder_id: str, _path: str = "") -> list[dict]:
+    """List video files in a Drive folder, recursing into subfolders."""
+    # Find video files in this folder
+    mime_query = " or ".join(f"mimeType='{m}'" for m in MOV_MIME_TYPES)
+    query = f"'{folder_id}' in parents and ({mime_query}) and trashed=false"
+    files = []
+    page_token = None
+    while True:
+        resp = service.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, size, mimeType, createdTime, modifiedTime, webViewLink)",
+            pageSize=100,
+            orderBy="name",
+            pageToken=page_token,
+        ).execute()
+        for f in resp.get("files", []):
+            # Skip macOS resource fork files
+            if f["name"].startswith("._"):
+                continue
+            f["_folder_path"] = _path
+            files.append(f)
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    # Recurse into subfolders
+    sub_query = (
+        f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder'"
+        " and trashed=false"
+    )
+    page_token = None
+    while True:
+        resp = service.files().list(
+            q=sub_query,
+            fields="nextPageToken, files(id, name)",
+            pageSize=100,
+            orderBy="name",
+            pageToken=page_token,
+        ).execute()
+        for sf in resp.get("files", []):
+            sub_path = f"{_path}{sf['name']}/" if _path else f"{sf['name']}/"
+            files.extend(list_video_files(service, sf["id"], sub_path))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    return files
+
+
+def list_existing_transcripts(service, folder_id: str) -> set[str]:
+    """Return set of base names that already have transcripts in output folder."""
+    query = (
+        f"'{folder_id}' in parents and mimeType='text/plain' and trashed=false"
+    )
+    names = set()
+    page_token = None
+    while True:
+        resp = service.files().list(
+            q=query,
+            fields="nextPageToken, files(name)",
+            pageSize=100,
+            pageToken=page_token,
+        ).execute()
+        for f in resp.get("files", []):
+            # Strip .txt extension to get base name
+            names.add(Path(f["name"]).stem)
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return names
+
+
+def ensure_subfolder(service, parent_id: str, name: str) -> str:
+    """Find or create a subfolder under parent_id."""
+    query = (
+        f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder'"
+        f" and name='{name}' and trashed=false"
+    )
+    resp = service.files().list(q=query, fields="files(id)").execute()
+    existing = resp.get("files", [])
+    if existing:
+        return existing[0]["id"]
+    meta = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    folder = service.files().create(body=meta, fields="id").execute()
+    return folder["id"]
+
+
+def download_file(service, file_id: str, dest_path: Path) -> None:
+    """Download a Drive file to local disk with progress."""
+    request = service.files().get_media(fileId=file_id)
+    with open(dest_path, "wb") as f:
+        downloader = MediaIoBaseDownload(f, request, chunksize=50 * 1024 * 1024)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            if status:
+                pct = int(status.progress() * 100)
+                print(f"  Downloading... {pct}%", end="\r")
+    print(f"  Downloaded: {dest_path.name} ({dest_path.stat().st_size / 1e9:.1f} GB)")
+
+
+def extract_audio(video_path: Path, audio_path: Path) -> None:
+    """Extract audio track from video using ffmpeg."""
+    print(f"  Extracting audio → {audio_path.name}...")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-i", str(video_path),
+            "-vn",                     # no video
+            "-acodec", "libmp3lame",   # mp3 codec
+            "-q:a", "2",               # high quality VBR
+            "-y",                      # overwrite
+            str(audio_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"  ffmpeg error:\n{result.stderr}")
+        raise RuntimeError("ffmpeg audio extraction failed")
+    size_mb = audio_path.stat().st_size / 1e6
+    print(f"  Audio extracted: {size_mb:.1f} MB")
+
+
+def stream_audio_from_drive(service, file_id: str, audio_path: Path) -> None:
+    """Stream audio extraction directly from Drive via ffmpeg (skips full download).
+
+    Uses the Drive API download URL with an OAuth access token so ffmpeg can
+    read the video over HTTP and extract only the audio track.  For large
+    video files this is dramatically faster than downloading the entire file
+    first because ffmpeg processes at ~40-50x realtime, limited only by the
+    Drive API bandwidth (~10 MB/s), and writes only the small audio track.
+    """
+    # Get a fresh access token from the service credentials
+    creds = service._http.credentials
+    creds.refresh(AuthRequest())  # always refresh to ensure valid token
+
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+    print(f"  Streaming audio extraction → {audio_path.name}...")
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-headers", f"Authorization: Bearer {creds.token}\r\n",
+            "-i", url,
+            "-vn",                     # no video
+            "-acodec", "libmp3lame",   # mp3 codec
+            "-q:a", "2",               # high quality VBR
+            "-y",                      # overwrite
+            str(audio_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        if "403" in result.stderr or "Forbidden" in result.stderr:
+            raise PermissionError("Drive download quota exceeded (will retry with full download)")
+        print(f"  ffmpeg stream error:\n{result.stderr[-500:]}")
+        raise RuntimeError("ffmpeg streaming audio extraction failed")
+    # Validate the output — if file is tiny relative to source, something went wrong
+    if not audio_path.exists() or audio_path.stat().st_size < 1000:
+        raise RuntimeError("Streaming produced empty/corrupt audio")
+    size_mb = audio_path.stat().st_size / 1e6
+    print(f"  Audio extracted: {size_mb:.1f} MB (streamed)")
+
+
+def get_audio_duration(audio_path: Path) -> float:
+    """Get audio duration in seconds using ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def upload_to_gemini(client, audio_path: Path):
+    """Upload audio to Gemini Files API and wait for ACTIVE."""
+    print(f"  Uploading to Gemini Files API...")
+    uploaded = client.files.upload(file=audio_path)
+    print(f"  Uploaded: {uploaded.name} ({uploaded.size_bytes} bytes)")
+
+    while uploaded.state.name == "PROCESSING":
+        print("  Waiting for Gemini to process file...", end="\r")
+        time.sleep(3)
+        uploaded = client.files.get(name=uploaded.name)
+
+    if uploaded.state.name == "FAILED":
+        raise RuntimeError(f"Gemini file processing failed: {uploaded.state}")
+
+    print(f"  Gemini file ready: {uploaded.state.name}")
+    return uploaded
+
+
+def transcribe_with_gemini(client, uploaded_file) -> tuple[str, dict]:
+    """Run diarized transcription. Returns (transcript_text, usage_dict)."""
+    print(f"  Requesting diarized transcription...")
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[uploaded_file, DIARIZATION_PROMPT],
+    )
+    usage = {}
+    if response.usage_metadata:
+        usage = {
+            "input_tokens": response.usage_metadata.prompt_token_count or 0,
+            "output_tokens": response.usage_metadata.candidates_token_count or 0,
+        }
+    return response.text, usage
+
+
+def upload_to_drive(service, folder_id: str, local_path: Path, mime_type: str,
+                    file_id: str | None = None) -> str:
+    """Upload a local file to a Drive folder. Returns file ID.
+
+    If file_id is given, overwrites that existing file instead of creating new.
+    """
+    media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
+    if file_id:
+        f = service.files().update(
+            fileId=file_id, media_body=media, fields="id"
+        ).execute()
+    else:
+        meta = {"name": local_path.name, "parents": [folder_id]}
+        f = service.files().create(body=meta, media_body=media, fields="id").execute()
+    return f["id"]
+
+
+def load_manifest(service, output_folder_id: str) -> tuple[dict, str | None]:
+    """Download manifest.json from Drive output folder, or return empty manifest.
+
+    Returns (manifest_dict, file_id_on_drive_or_None).
+    """
+    query = (
+        f"'{output_folder_id}' in parents and name='manifest.json' and trashed=false"
+    )
+    resp = service.files().list(q=query, fields="files(id)").execute()
+    existing = resp.get("files", [])
+    if existing:
+        manifest_file_id = existing[0]["id"]
+        request = service.files().get_media(fileId=manifest_file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        manifest = json.loads(buf.read().decode("utf-8"))
+        return manifest, manifest_file_id
+    return {
+        "source_folder_id": output_folder_id,
+        "generated_by": "transcribe_drive",
+        "files": [],
+    }, None
+
+
+def save_manifest(service, output_folder_id: str, manifest: dict,
+                  manifest_file_id: str | None) -> str:
+    """Write manifest.json to Drive. Overwrites if manifest_file_id given.
+
+    Returns the Drive file ID.
+    """
+    tmp_dir = Path("/tmp/transcribe_drive")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / "manifest.json"
+    tmp_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    file_id = upload_to_drive(
+        service, output_folder_id, tmp_path, "application/json",
+        file_id=manifest_file_id,
+    )
+    tmp_path.unlink(missing_ok=True)
+    return file_id
+
+
+def estimate_cost(duration_secs: float, output_tokens: int = 10000) -> float:
+    """Estimate Gemini API cost for an audio file."""
+    input_tokens = duration_secs * TOKENS_PER_SEC
+    input_cost = (input_tokens / 1e6) * PRICE_INPUT_PER_M
+    output_cost = (output_tokens / 1e6) * PRICE_OUTPUT_PER_M
+    return input_cost + output_cost
+
+
+def format_duration(seconds: float) -> str:
+    """Format seconds as HH:MM:SS."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def format_size(size_bytes: int | str) -> str:
+    """Format bytes as human-readable size."""
+    n = int(size_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def build_transcript_header(file_meta: dict, duration_secs: float) -> str:
+    """Build a metadata header block to prepend to transcripts."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        f"# Source: {file_meta['name']}",
+        f"# Source ID: {file_meta['id']}",
+        f"# Source URL: {file_meta.get('webViewLink', 'N/A')}",
+        f"# Source Created: {file_meta.get('createdTime', 'N/A')}",
+        f"# Source Modified: {file_meta.get('modifiedTime', 'N/A')}",
+        f"# Audio Duration: {format_duration(duration_secs)}",
+        f"# Transcribed: {now}",
+        "# ---",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# --- COMMANDS ---
+
+def cmd_list(args):
+    """List video files in a Drive folder."""
+    folder_id = extract_folder_id(args.folder)
+    print(f"Listing video files in folder: {folder_id}\n")
+
+    service = get_drive_service()
+    files = list_video_files(service, folder_id)
+
+    if not files:
+        print("No video files found.")
+        return
+
+    total_size = 0
+    for i, f in enumerate(files, 1):
+        size = int(f.get("size", 0))
+        total_size += size
+        created = f.get("createdTime", "")[:10] or "N/A"
+        modified = f.get("modifiedTime", "")[:10] or "N/A"
+        folder_path = f.get("_folder_path", "")
+        display_name = f"{folder_path}{f['name']}" if folder_path else f['name']
+        print(f"  {i:3d}. {display_name}")
+        print(f"       ID: {f['id']}  Size: {format_size(size)}  Created: {created}  Modified: {modified}")
+
+    print(f"\n{len(files)} files, {format_size(total_size)} total")
+
+
+def cmd_transcribe(args):
+    """Transcribe a single file."""
+    file_id = args.file_id
+    output_folder_id = args.output_folder
+
+    service = get_drive_service()
+    gemini = get_gemini_client()
+
+    # Get file metadata
+    file_meta = service.files().get(
+        fileId=file_id, fields="id, name, size, mimeType, createdTime, modifiedTime, webViewLink"
+    ).execute()
+    name = file_meta["name"]
+    base_name = Path(name).stem
+    print(f"\nProcessing: {name} ({format_size(file_meta.get('size', 0))})")
+
+    # Create output subfolders if output folder specified
+    transcript_folder_id = None
+    audio_folder_id = None
+    if output_folder_id:
+        transcript_folder_id = ensure_subfolder(service, output_folder_id, "transcripts")
+        audio_folder_id = ensure_subfolder(service, output_folder_id, "audio")
+
+    # Download
+    tmp_dir = Path("/tmp/transcribe_drive")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_dir / name
+    audio_path = tmp_dir / f"{base_name}.mp3"
+    transcript_path = tmp_dir / f"{base_name}.txt"
+
+    try:
+        try:
+            stream_audio_from_drive(service, file_id, audio_path)
+        except (PermissionError, RuntimeError) as stream_err:
+            print(f"  Stream failed: {stream_err}")
+            print(f"  Falling back to full download...")
+            video_path = tmp_dir / name
+            download_file(service, file_id, video_path)
+            extract_audio(video_path, audio_path)
+            video_path.unlink()
+
+        duration = get_audio_duration(audio_path)
+        est_cost = estimate_cost(duration)
+        print(f"  Audio duration: {format_duration(duration)}")
+        print(f"  Estimated cost: ${est_cost:.3f}")
+
+        # Upload to Gemini and transcribe
+        uploaded = upload_to_gemini(gemini, audio_path)
+        transcript, usage = transcribe_with_gemini(gemini, uploaded)
+
+        # Clean up Gemini file
+        try:
+            gemini.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+        # Prepend metadata header and save transcript locally
+        header = build_transcript_header(file_meta, duration)
+        transcript_with_header = header + transcript
+        transcript_path.write_text(transcript_with_header, encoding="utf-8")
+        print(f"  Transcript: {len(transcript)} chars, {transcript.count(chr(10))+1} lines")
+
+        actual_cost = 0.0
+        if usage:
+            actual_cost = (
+                (usage["input_tokens"] / 1e6) * PRICE_INPUT_PER_M
+                + (usage["output_tokens"] / 1e6) * PRICE_OUTPUT_PER_M
+            )
+            print(f"  Tokens: {usage['input_tokens']:,} in / {usage['output_tokens']:,} out")
+            print(f"  Actual cost: ${actual_cost:.3f}")
+
+        # Upload results to Drive
+        if transcript_folder_id:
+            upload_to_drive(service, transcript_folder_id, transcript_path, "text/plain")
+            print(f"  Uploaded transcript to Drive: transcripts/{base_name}.txt")
+        if audio_folder_id:
+            upload_to_drive(service, audio_folder_id, audio_path, "audio/mpeg")
+            print(f"  Uploaded audio to Drive: audio/{base_name}.mp3")
+
+        # Build manifest entry
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        manifest_entry = {
+            "source_file_id": file_meta["id"],
+            "source_file_name": file_meta["name"],
+            "source_url": file_meta.get("webViewLink", ""),
+            "source_created": file_meta.get("createdTime", ""),
+            "source_modified": file_meta.get("modifiedTime", ""),
+            "source_size_bytes": int(file_meta.get("size", 0)),
+            "transcript_file": f"transcripts/{base_name}.txt",
+            "audio_file": f"audio/{base_name}.mp3",
+            "audio_duration_secs": round(duration, 1),
+            "transcribed_at": now,
+            "gemini_input_tokens": usage.get("input_tokens", 0),
+            "gemini_output_tokens": usage.get("output_tokens", 0),
+            "gemini_cost_usd": round(actual_cost, 4),
+        }
+
+        # Update manifest on Drive if output folder specified
+        if output_folder_id:
+            manifest, manifest_file_id = load_manifest(service, output_folder_id)
+            manifest["files"].append(manifest_entry)
+            save_manifest(service, output_folder_id, manifest, manifest_file_id)
+            print(f"  Manifest updated on Drive")
+
+        if not output_folder_id:
+            # Print transcript to stdout if no output folder
+            print(f"\n{'='*60}")
+            print(transcript_with_header)
+            print(f"{'='*60}")
+
+        return manifest_entry
+
+    finally:
+        # Clean up local files
+        for p in [video_path, audio_path, transcript_path]:
+            if p.exists():
+                p.unlink()
+
+
+def cmd_batch(args):
+    """Batch-transcribe all video files in a Drive folder."""
+    folder_id = extract_folder_id(args.folder)
+    output_folder_id = args.output_folder
+    budget = args.budget
+
+    service = get_drive_service()
+    gemini = get_gemini_client()
+
+    print(f"Source folder: {folder_id}")
+    if output_folder_id:
+        print(f"Output folder: {output_folder_id}")
+
+    # List source files
+    files = list_video_files(service, folder_id)
+    if not files:
+        print("No video files found.")
+        return
+
+    print(f"Found {len(files)} video files")
+
+    # Load manifest for skip logic (by source file ID)
+    manifest = None
+    manifest_file_id = None
+    transcribed_ids = set()
+    if output_folder_id:
+        transcript_folder_id = ensure_subfolder(service, output_folder_id, "transcripts")
+        audio_folder_id = ensure_subfolder(service, output_folder_id, "audio")
+        manifest, manifest_file_id = load_manifest(service, output_folder_id)
+        manifest["source_folder_id"] = folder_id
+        transcribed_ids = {e["source_file_id"] for e in manifest.get("files", [])}
+        if transcribed_ids:
+            print(f"  Manifest loaded: {len(transcribed_ids)} files already transcribed")
+    else:
+        transcript_folder_id = None
+        audio_folder_id = None
+
+    # Filter out already-transcribed files by source ID
+    pending = []
+    for f in files:
+        if f["id"] in transcribed_ids:
+            print(f"  SKIP (in manifest): {f['name']}")
+        else:
+            pending.append(f)
+
+    if not pending:
+        print("\nAll files already transcribed!")
+        return
+
+    print(f"\n{len(pending)} files to transcribe ({len(transcribed_ids)} already done)")
+
+    # Budget tracking
+    total_cost = 0.0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_duration = 0.0
+    results = []
+    budget_limit = budget
+    start_time = time.time()
+
+    tmp_dir = Path("/tmp/transcribe_drive")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, f in enumerate(pending, 1):
+        name = f["name"]
+        file_id = f["id"]
+        base_name = Path(name).stem
+        print(f"\n{'='*60}")
+        print(f"[{i}/{len(pending)}] {name} ({format_size(f.get('size', 0))})")
+        print(f"{'='*60}")
+
+        video_path = tmp_dir / name
+        audio_path = tmp_dir / f"{base_name}.mp3"
+        transcript_path = tmp_dir / f"{base_name}.txt"
+
+        try:
+            try:
+                stream_audio_from_drive(service, file_id, audio_path)
+            except (PermissionError, RuntimeError) as stream_err:
+                print(f"  Stream failed: {stream_err}")
+                print(f"  Falling back to full download...")
+                video_path = tmp_dir / name
+                download_file(service, file_id, video_path)
+                extract_audio(video_path, audio_path)
+                video_path.unlink()
+
+            duration = get_audio_duration(audio_path)
+            est_cost = estimate_cost(duration)
+            print(f"  Audio duration: {format_duration(duration)}")
+            print(f"  Estimated cost: ${est_cost:.3f}")
+
+            # Budget check (before spending)
+            if budget_limit is not None and total_cost + est_cost > budget_limit:
+                print(f"\n  BUDGET LIMIT: Would exceed ${budget_limit:.2f} "
+                      f"(spent ${total_cost:.2f} + est ${est_cost:.3f})")
+                print(f"  Stopping batch. {len(pending) - i} files remaining.")
+                break
+
+            # Transcribe
+            uploaded = upload_to_gemini(gemini, audio_path)
+            transcript, usage = transcribe_with_gemini(gemini, uploaded)
+
+            try:
+                gemini.files.delete(name=uploaded.name)
+            except Exception:
+                pass
+
+            # Prepend metadata header
+            header = build_transcript_header(f, duration)
+            transcript_with_header = header + transcript
+            transcript_path.write_text(transcript_with_header, encoding="utf-8")
+
+            # Track costs
+            file_cost = 0.0
+            if usage:
+                file_cost = (
+                    (usage["input_tokens"] / 1e6) * PRICE_INPUT_PER_M
+                    + (usage["output_tokens"] / 1e6) * PRICE_OUTPUT_PER_M
+                )
+                total_input_tokens += usage["input_tokens"]
+                total_output_tokens += usage["output_tokens"]
+
+            total_cost += file_cost
+            total_duration += duration
+
+            # Set budget limit after first file if not specified
+            if budget_limit is None and i == 1 and file_cost > 0:
+                budget_limit = file_cost * len(pending) * 2
+                print(f"  Auto-budget set: ${budget_limit:.2f} "
+                      f"(2x extrapolated from first file)")
+
+            # Upload results to Drive
+            if transcript_folder_id:
+                upload_to_drive(service, transcript_folder_id, transcript_path, "text/plain")
+                print(f"  → Transcript uploaded to Drive")
+            if audio_folder_id:
+                upload_to_drive(service, audio_folder_id, audio_path, "audio/mpeg")
+                print(f"  → Audio uploaded to Drive")
+
+            # Build manifest entry and save
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            manifest_entry = {
+                "source_file_id": file_id,
+                "source_file_name": name,
+                "source_url": f.get("webViewLink", ""),
+                "source_created": f.get("createdTime", ""),
+                "source_modified": f.get("modifiedTime", ""),
+                "source_size_bytes": int(f.get("size", 0)),
+                "transcript_file": f"transcripts/{base_name}.txt",
+                "audio_file": f"audio/{base_name}.mp3",
+                "audio_duration_secs": round(duration, 1),
+                "transcribed_at": now,
+                "gemini_input_tokens": usage.get("input_tokens", 0),
+                "gemini_output_tokens": usage.get("output_tokens", 0),
+                "gemini_cost_usd": round(file_cost, 4),
+            }
+
+            if manifest is not None:
+                manifest["files"].append(manifest_entry)
+                manifest_file_id = save_manifest(
+                    service, output_folder_id, manifest, manifest_file_id
+                )
+                print(f"  → Manifest updated ({len(manifest['files'])} entries)")
+
+            results.append({
+                "name": name,
+                "duration": duration,
+                "cost": file_cost,
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+            })
+
+            print(f"  Cost: ${file_cost:.3f} | Running total: ${total_cost:.2f}")
+
+        except Exception as e:
+            print(f"  ERROR processing {name}: {e}")
+            results.append({"name": name, "error": str(e)})
+
+        finally:
+            for p in [video_path, audio_path, transcript_path]:
+                if p.exists():
+                    p.unlink()
+
+        # Delay between files to avoid rate limiting
+        if i < len(pending):
+            delay = int(os.environ.get("TRANSCRIBE_DELAY", "45"))
+            print(f"  Waiting {delay}s before next file...")
+            time.sleep(delay)
+
+    # --- SUMMARY ---
+    elapsed = time.time() - start_time
+    print(f"\n{'='*60}")
+    print(f"BATCH COMPLETE")
+    print(f"{'='*60}")
+    successes = [r for r in results if "error" not in r]
+    failures = [r for r in results if "error" in r]
+    print(f"  Files processed: {len(successes)}/{len(pending)}")
+    if failures:
+        print(f"  Failures: {len(failures)}")
+        for r in failures:
+            print(f"    - {r['name']}: {r['error']}")
+    print(f"  Total audio: {format_duration(total_duration)}")
+    print(f"  Total tokens: {total_input_tokens:,} in / {total_output_tokens:,} out")
+    print(f"  Total cost: ${total_cost:.2f}")
+    print(f"  Elapsed time: {format_duration(elapsed)}")
+    if successes:
+        avg_cost = total_cost / len(successes)
+        print(f"  Avg cost/file: ${avg_cost:.3f}")
+    # Send notification via ntfy (set NTFY_TOPIC and optionally NTFY_EMAIL in env)
+    ntfy_topic = os.environ.get("NTFY_TOPIC", "")
+    ntfy_email = os.environ.get("NTFY_EMAIL", "")
+    if ntfy_topic:
+        try:
+            import urllib.request
+            status = "SUCCESS" if not failures else f"PARTIAL ({len(failures)} failures)"
+            if not successes and failures:
+                status = "FAILED (all files errored)"
+            parts = [f"Batch {status}", f"Processed: {len(successes)}/{len(pending)}", f"Cost: ${total_cost:.2f}", f"Duration: {format_duration(elapsed)}"]
+            if failures:
+                parts.append(f"Failed files: {len(failures)}")
+            msg = chr(10).join(parts)
+            headers = {"Title": f"Transcribe batch: {status}"}
+            if ntfy_email:
+                headers["Email"] = ntfy_email
+            req = urllib.request.Request(
+                f"https://ntfy.sh/{ntfy_topic}",
+                data=msg.encode(),
+                headers=headers,
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as notify_err:
+            print(f"  (notification failed: {notify_err})")
+
+
+
+# --- MAIN ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Google Drive .mov → diarized transcription via Gemini",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # list
+    p_list = subparsers.add_parser("list", help="List video files in a Drive folder")
+    p_list.add_argument("folder", help="Drive folder URL or ID")
+
+    # transcribe
+    p_trans = subparsers.add_parser("transcribe", help="Transcribe a single file")
+    p_trans.add_argument("file_id", help="Drive file ID")
+    p_trans.add_argument("--output-folder", help="Drive folder ID for output")
+
+    # batch
+    p_batch = subparsers.add_parser("batch", help="Batch-transcribe all files in a folder")
+    p_batch.add_argument("folder", help="Drive folder URL or ID")
+    p_batch.add_argument("--output-folder", help="Drive folder ID for output")
+    p_batch.add_argument("--budget", type=float, default=None,
+                         help="Max spend in dollars (default: 2x estimated)")
+
+    args = parser.parse_args()
+
+    if args.command == "list":
+        cmd_list(args)
+    elif args.command == "transcribe":
+        cmd_transcribe(args)
+    elif args.command == "batch":
+        cmd_batch(args)
+
+
+if __name__ == "__main__":
+    main()

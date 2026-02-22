@@ -1,0 +1,16 @@
+# Secrets
+transcribe.env
+transcribe_client_secret.json
+.transcribe_drive_token.json
+
+# Python
+__pycache__/
+*.pyc
+.transcribe_drive_venv/
+
+# Local files
+*.mp3
+*.wav
+*.mov
+*.mp4
+manifest.json
