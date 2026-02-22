@@ -228,26 +228,43 @@ def sanitize_name(name: str) -> str:
 
 
 def resolve_provider(args):
-    """Determine the provider from --source flag or auto-detect from the folder/file arg."""
+    """Determine the source provider from --source flag or auto-detect."""
     source = getattr(args, "source", None)
     if source:
         return get_provider(source, script_dir)
-
-    # Auto-detect from the first positional argument
     ref = getattr(args, "folder", None) or getattr(args, "file_id", None) or ""
-    detected = detect_provider(ref)
-    return get_provider(detected, script_dir)
+    return get_provider(detect_provider(ref), script_dir)
+
+
+def resolve_output_provider(args):
+    """Determine the output provider from --output-source flag or auto-detect from --output-folder."""
+    output_source = getattr(args, "output_source", None)
+    if output_source:
+        return get_provider(output_source, script_dir)
+    ref = getattr(args, "output_folder", None) or ""
+    if not ref:
+        return None
+    return get_provider(detect_provider(ref), script_dir)
 
 
 def process_single_file(provider, service, gemini, file_meta: dict,
                         transcript_folder_id: str | None,
                         audio_folder_id: str | None,
                         output_folder_id: str | None,
-                        tmp_dir: Path) -> tuple[dict, float, float, dict]:
+                        tmp_dir: Path,
+                        out_provider=None,
+                        out_service=None) -> tuple[dict, float, float, dict]:
     """Process one file: stream/download → transcribe → upload.
+
+    out_provider/out_service are used for uploads; fall back to source
+    provider/service if not specified (same-provider case).
 
     Returns (manifest_entry, actual_cost, duration, usage).
     """
+    if out_provider is None:
+        out_provider = provider
+    if out_service is None:
+        out_service = service
     name = file_meta["name"]
     file_id = file_meta["id"]
     base_name = Path(name).stem
@@ -296,12 +313,12 @@ def process_single_file(provider, service, gemini, file_meta: dict,
             print(f"  Tokens: {usage['input_tokens']:,} in / {usage['output_tokens']:,} out")
             print(f"  Actual cost: ${actual_cost:.3f}")
 
-        # Upload results
+        # Upload results to output provider (may differ from source provider)
         if transcript_folder_id:
-            provider.upload_file(service, transcript_folder_id, transcript_path, "text/plain")
+            out_provider.upload_file(out_service, transcript_folder_id, transcript_path, "text/plain")
             print(f"  Uploaded transcript: transcripts/{base_name}.txt")
         if audio_folder_id:
-            provider.upload_file(service, audio_folder_id, audio_path, "audio/mpeg")
+            out_provider.upload_file(out_service, audio_folder_id, audio_path, "audio/mpeg")
             print(f"  Uploaded audio: audio/{base_name}.mp3")
 
         # Build manifest entry
@@ -368,39 +385,41 @@ def cmd_transcribe(args):
     """Transcribe a single file."""
     provider = resolve_provider(args)
     service = provider.connect()
+    out_provider = resolve_output_provider(args)
+    out_service = out_provider.connect() if out_provider else None
     gemini = get_gemini_client()
 
     file_id = args.file_id
     output_folder_id = args.output_folder
 
     file_meta = provider.get_file_metadata(service, file_id)
-
     print(f"\nProcessing: {file_meta['name']} ({format_size(file_meta.get('size', 0))})")
 
     # Create a job-specific output subfolder to avoid conflicts with concurrent jobs
     transcript_folder_id = None
     audio_folder_id = None
     job_folder_id = None
-    if output_folder_id:
+    if output_folder_id and out_provider and out_service:
         src_name = sanitize_name(provider.get_folder_name(service, file_id))
-        job_folder_id = provider.ensure_subfolder(service, output_folder_id, src_name)
+        job_folder_id = out_provider.ensure_subfolder(out_service, output_folder_id, src_name)
         print(f"Output subfolder: {src_name}")
-        transcript_folder_id = provider.ensure_subfolder(service, job_folder_id, "transcripts")
-        audio_folder_id = provider.ensure_subfolder(service, job_folder_id, "audio")
+        transcript_folder_id = out_provider.ensure_subfolder(out_service, job_folder_id, "transcripts")
+        audio_folder_id = out_provider.ensure_subfolder(out_service, job_folder_id, "audio")
 
-    tmp_dir = Path("/tmp/transcribe_drive")
+    tmp_dir = Path(f"/tmp/transcribe_drive/{os.getpid()}")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_entry, actual_cost, duration, usage = process_single_file(
         provider, service, gemini, file_meta,
         transcript_folder_id, audio_folder_id, job_folder_id, tmp_dir,
+        out_provider=out_provider, out_service=out_service,
     )
 
     # Update manifest in job subfolder
-    if job_folder_id:
-        manifest, manifest_file_id = provider.load_manifest(service, job_folder_id)
+    if job_folder_id and out_provider and out_service:
+        manifest, manifest_file_id = out_provider.load_manifest(out_service, job_folder_id)
         manifest["files"].append(manifest_entry)
-        provider.save_manifest(service, job_folder_id, manifest, manifest_file_id)
+        out_provider.save_manifest(out_service, job_folder_id, manifest, manifest_file_id)
         print(f"  Manifest updated")
 
     return manifest_entry
@@ -410,6 +429,8 @@ def cmd_batch(args):
     """Batch-transcribe all video files in a cloud folder."""
     provider = resolve_provider(args)
     service = provider.connect()
+    out_provider = resolve_output_provider(args)
+    out_service = out_provider.connect() if out_provider else None
     gemini = get_gemini_client()
 
     folder_ref = provider.extract_folder_ref(args.folder)
@@ -421,9 +442,9 @@ def cmd_batch(args):
     # Create a job-specific output subfolder named after the source folder
     # so concurrent jobs writing to the same output root don't collide.
     job_folder_id = None
-    if output_folder_id:
+    if output_folder_id and out_provider and out_service:
         src_name = sanitize_name(provider.get_folder_name(service, folder_ref))
-        job_folder_id = provider.ensure_subfolder(service, output_folder_id, src_name)
+        job_folder_id = out_provider.ensure_subfolder(out_service, output_folder_id, src_name)
         print(f"Output subfolder: {src_name}/ (in {output_folder_id})")
 
     # List source files
@@ -440,10 +461,10 @@ def cmd_batch(args):
     transcribed_ids = set()
     transcript_folder_id = None
     audio_folder_id = None
-    if job_folder_id:
-        transcript_folder_id = provider.ensure_subfolder(service, job_folder_id, "transcripts")
-        audio_folder_id = provider.ensure_subfolder(service, job_folder_id, "audio")
-        manifest, manifest_file_id = provider.load_manifest(service, job_folder_id)
+    if job_folder_id and out_provider and out_service:
+        transcript_folder_id = out_provider.ensure_subfolder(out_service, job_folder_id, "transcripts")
+        audio_folder_id = out_provider.ensure_subfolder(out_service, job_folder_id, "audio")
+        manifest, manifest_file_id = out_provider.load_manifest(out_service, job_folder_id)
         manifest["source_folder_id"] = folder_ref
         transcribed_ids = {e["source_file_id"] for e in manifest.get("files", [])}
         if transcribed_ids:
@@ -485,6 +506,7 @@ def cmd_batch(args):
             manifest_entry, file_cost, duration, usage = process_single_file(
                 provider, service, gemini, f,
                 transcript_folder_id, audio_folder_id, job_folder_id, tmp_dir,
+                out_provider=out_provider, out_service=out_service,
             )
 
             total_cost += file_cost
@@ -499,11 +521,11 @@ def cmd_batch(args):
                 print(f"  Auto-budget set: ${budget_limit:.2f} "
                       f"(2x extrapolated from first file)")
 
-            # Update manifest
-            if manifest is not None:
+            # Update manifest via output provider
+            if manifest is not None and out_provider and out_service:
                 manifest["files"].append(manifest_entry)
-                manifest_file_id = provider.save_manifest(
-                    service, job_folder_id, manifest, manifest_file_id
+                manifest_file_id = out_provider.save_manifest(
+                    out_service, job_folder_id, manifest, manifest_file_id
                 )
                 print(f"  → Manifest updated ({len(manifest['files'])} entries)")
 
@@ -592,7 +614,8 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    source_help = "Storage provider: drive or dropbox (default: auto-detect from URL)"
+    source_help = "Source provider: drive or dropbox (default: auto-detect from URL)"
+    output_source_help = "Output provider: drive or dropbox (default: auto-detect from --output-folder)"
 
     # list
     p_list = subparsers.add_parser("list", help="List video files in a folder")
@@ -606,6 +629,8 @@ def main():
     p_trans.add_argument("--output-folder", help="Output folder ID or path")
     p_trans.add_argument("--source", choices=["drive", "dropbox"], default=None,
                          help=source_help)
+    p_trans.add_argument("--output-source", choices=["drive", "dropbox"], default=None,
+                         help=output_source_help)
 
     # batch
     p_batch = subparsers.add_parser("batch", help="Batch-transcribe all files in a folder")
@@ -615,6 +640,8 @@ def main():
                          help="Max spend in dollars (default: 2x estimated)")
     p_batch.add_argument("--source", choices=["drive", "dropbox"], default=None,
                          help=source_help)
+    p_batch.add_argument("--output-source", choices=["drive", "dropbox"], default=None,
+                         help=output_source_help)
 
     args = parser.parse_args()
 
