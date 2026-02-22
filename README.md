@@ -1,19 +1,19 @@
 # transcribe_drive
 
-Batch transcription system for video files on Google Drive using Google Gemini for speaker-diarized transcription.
+Batch transcription system for video files on Google Drive or Dropbox using Google Gemini for speaker-diarized transcription.
 
 ## Overview
 
-Takes a Google Drive folder of video files (.mov, .mp4, .avi, .mkv), extracts audio, sends it to Gemini for speaker-diarized transcription, and uploads the results (transcripts + mp3 audio) back to a Drive output folder. Tracks progress via a manifest so batches can be interrupted and resumed.
+Takes a cloud folder (Google Drive or Dropbox) of video files (.mov, .mp4, .avi, .mkv), extracts audio, sends it to Gemini for speaker-diarized transcription, and uploads the results (transcripts + mp3 audio) back to an output folder. Tracks progress via a manifest so batches can be interrupted and resumed.
 
 ## Architecture
 
 ```
-Google Drive (source)          Local / VM                      Google Drive (output)
+Cloud Storage (source)         Local / VM                      Cloud Storage (output)
 ┌──────────────┐       ┌─────────────────────────┐       ┌──────────────────┐
-│ Source folder │──────>│ ffmpeg stream extraction │──────>│ Output folder    │
-│  .mov/.mp4   │ Drive │ (video→mp3 over HTTP)   │       │  transcripts/    │
-│  files       │  API  │                         │       │  audio/          │
+│ Drive or     │──────>│ ffmpeg stream extraction │──────>│ Output folder    │
+│ Dropbox      │ HTTP  │ (video→mp3 over HTTP)   │       │  transcripts/    │
+│ video files  │       │                         │       │  audio/          │
 └──────────────┘       │ Gemini 2.5 Pro API      │       │  manifest.json   │
                        │ (audio→transcript)      │──────>│                  │
                        └─────────────────────────┘       └──────────────────┘
@@ -23,23 +23,37 @@ Google Drive (source)          Local / VM                      Google Drive (out
 
 - Python 3.10+
 - ffmpeg
-- A Google Cloud project with:
-  - Gemini API enabled and an API key (with billing for Gemini 2.5 Pro)
-  - OAuth 2.0 client credentials (Desktop app type) for Drive access
+- A Gemini API key (with billing for Gemini 2.5 Pro)
+- **For Google Drive**: OAuth 2.0 client credentials (Desktop app type) for Drive access
+- **For Dropbox**: A Dropbox app with `files.metadata.read`, `files.content.read`, `files.content.write` permissions
 
 ## Setup
+
+### Common setup
 
 1. Clone this repo and put `transcribe_drive` somewhere on your `$PATH` (e.g. `~/bin/`)
 2. Copy `transcribe.env.example` to `transcribe.env` in the same directory as the script
 3. Fill in your `GEMINI_API_KEY`
+
+### Google Drive setup
+
 4. Place your OAuth client credentials JSON as `transcribe_client_secret.json` next to the script
 5. On first run, a browser window opens for Google OAuth login
 
-The script auto-creates a Python venv and installs dependencies (`google-genai`, `google-auth-oauthlib`, `google-api-python-client`).
+### Dropbox setup
+
+4. Create a Dropbox app at https://www.dropbox.com/developers/apps (Full Dropbox access)
+5. Add `DROPBOX_APP_KEY` and `DROPBOX_APP_SECRET` to `transcribe.env`
+6. On first run, you'll be prompted to visit a URL and paste an authorization code
+7. Refresh tokens are saved to `.transcribe_dropbox_token.json` (they don't expire)
+
+The script auto-creates a Python venv and installs dependencies (`google-genai`, `google-auth-oauthlib`, `google-api-python-client`, `dropbox`).
 
 ## Usage
 
 ```bash
+# --- Google Drive (default) ---
+
 # List video files in a Drive folder
 transcribe_drive list <folder_url_or_id>
 
@@ -48,7 +62,20 @@ transcribe_drive transcribe <file_id> [--output-folder DRIVE_FOLDER_ID]
 
 # Batch transcribe all files in a folder
 transcribe_drive batch <folder_url_or_id> --output-folder DRIVE_FOLDER_ID [--budget DOLLARS]
+
+# --- Dropbox ---
+
+# List video files in a Dropbox folder
+transcribe_drive list /Videos --source dropbox
+
+# Transcribe a single file
+transcribe_drive transcribe /Videos/meeting.mov --source dropbox --output-folder /Output
+
+# Batch transcribe
+transcribe_drive batch /Videos --source dropbox --output-folder /Output --budget 5
 ```
+
+The `--source` flag accepts `drive` or `dropbox`. If omitted, the source is auto-detected from the URL/path (Drive URLs → drive, paths starting with `/` → dropbox, bare IDs → drive).
 
 ### Running a batch on a VM
 
@@ -61,6 +88,28 @@ tmux send-keys -t batch 'cd ~/bin && python3 -u transcribe_drive batch <SOURCE_F
 # Monitor progress
 tail -20 /tmp/batch.log
 ```
+
+### Auto-retry for quota-blocked batches
+
+When Drive download quotas block files, use `transcribe_retry.sh` to automatically retry on a schedule:
+
+```bash
+# Configure env vars
+export SOURCE_FOLDER="your-source-folder-id"
+export OUTPUT_FOLDER="your-output-folder-id"
+export BUDGET=40
+export NTFY_TOPIC="my-transcribe-topic"  # optional
+export NTFY_EMAIL="you@example.com"       # optional
+
+# Add to cron (every 6 hours)
+echo '30 */6 * * * SOURCE_FOLDER=xxx OUTPUT_FOLDER=yyy /path/to/transcribe_retry.sh >> /tmp/transcribe_retry/cron.log 2>&1' | crontab -
+```
+
+The retry script:
+- Uses a lockfile to prevent overlapping runs
+- Sends ntfy notifications when files succeed
+- Auto-removes itself from cron when all files are complete
+- Keeps the last 10 log files
 
 ## How it works
 
@@ -130,7 +179,18 @@ The script uses OAuth (not a service account) for Drive access. First run trigge
 
 **Scopes**: `drive.readonly` (read source files) + `drive.file` (write to output folder)
 
-**To switch accounts**: delete `.transcribe_drive_token.json` and re-run.
+**To switch accounts**: delete `.transcribe_drive_token.json` (Drive) or `.transcribe_dropbox_token.json` (Dropbox) and re-run.
+
+## Dropbox vs Drive comparison
+
+| Aspect | Google Drive | Dropbox |
+|--------|-------------|---------|
+| File identifiers | Opaque IDs | Filesystem paths |
+| Streaming URL | Needs `Authorization: Bearer` header | Temp link, no auth needed |
+| Download quota | Per-file global quota (24h reset) | None |
+| Folder listing | Query-based | Path-based, recursive |
+| Created time | Available | Not available |
+| Upload large files | MediaFileUpload | Chunked sessions (>150MB) |
 
 ## Known issues & limitations
 
