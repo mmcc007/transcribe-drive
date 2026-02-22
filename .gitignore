@@ -2,6 +2,7 @@
 transcribe.env
 transcribe_client_secret.json
 .transcribe_drive_token.json
+.transcribe_dropbox_token.json
 
 # Python
 __pycache__/
