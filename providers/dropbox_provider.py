@@ -26,6 +26,8 @@ class DropboxProvider:
     def __init__(self, script_dir: Path) -> None:
         self.script_dir = script_dir
         self.token_path = script_dir / ".transcribe_dropbox_token.json"
+        # Set when listing a shared folder URL; used by stream_audio fallback.
+        self._shared_url: str | None = None
 
     # -- auth ----------------------------------------------------------------
 
@@ -151,6 +153,7 @@ class DropboxProvider:
         is_shared_link = folder_path.startswith("https://")
 
         if is_shared_link:
+            self._shared_url = folder_path  # remember for stream_audio fallback
             return self._list_shared_link_recursive(service, folder_path)
 
         files: list[dict] = []
@@ -268,19 +271,41 @@ class DropboxProvider:
     # -- download / stream ---------------------------------------------------
 
     def stream_audio(self, service, file_path: str, audio_path: Path) -> None:
-        """Stream audio extraction from Dropbox via a temporary link.
+        """Stream audio extraction from Dropbox.
 
-        Dropbox temporary links are public URLs valid for 4 hours — no auth
-        headers needed for ffmpeg.
+        For owned files: uses a temporary link (fast, no auth headers needed).
+        For shared folder files: uses the Dropbox content API URL with a Bearer
+        token so ffmpeg can make range requests (required for moov-at-end MOV).
         """
-        link_result = service.files_get_temporary_link(file_path)
-        url = link_result.link
+        ffmpeg_args: list[str]
+
+        try:
+            link_result = service.files_get_temporary_link(file_path)
+            url = link_result.link
+            ffmpeg_args = ["ffmpeg", "-i", url]
+        except ApiError:
+            # Shared folder file — temp links are not available.
+            # Use the sharing/get_shared_link_file API endpoint with auth headers.
+            # The server supports Accept-Ranges so ffmpeg can seek (moov atom).
+            if not self._shared_url:
+                raise RuntimeError(
+                    "Cannot stream shared folder file: shared URL not set. "
+                    "Call list_video_files first."
+                )
+            service.check_and_refresh_access_token()
+            token = service._oauth2_access_token
+            api_arg = json.dumps({"url": self._shared_url, "path": file_path})
+            api_url = "https://content.dropboxapi.com/2/sharing/get_shared_link_file"
+            headers_str = (
+                f"Authorization: Bearer {token}\r\n"
+                f"Dropbox-API-Arg: {api_arg}\r\n"
+            )
+            ffmpeg_args = ["ffmpeg", "-headers", headers_str, "-i", api_url]
+            print(f"  (using API streaming — shared folder file)")
 
         print(f"  Streaming audio extraction → {audio_path.name}...")
         result = subprocess.run(
-            [
-                "ffmpeg",
-                "-i", url,
+            ffmpeg_args + [
                 "-vn",
                 "-acodec", "libmp3lame",
                 "-q:a", "2",
