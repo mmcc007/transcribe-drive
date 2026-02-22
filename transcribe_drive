@@ -377,7 +377,7 @@ def cmd_transcribe(args):
         transcript_folder_id = provider.ensure_subfolder(service, output_folder_id, "transcripts")
         audio_folder_id = provider.ensure_subfolder(service, output_folder_id, "audio")
 
-    tmp_dir = Path("/tmp/transcribe_drive")
+    tmp_dir = Path(f"/tmp/transcribe_drive/{os.getpid()}")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_entry, actual_cost, duration, usage = process_single_file(
@@ -455,7 +455,7 @@ def cmd_batch(args):
     budget_limit = budget
     start_time = time.time()
 
-    tmp_dir = Path("/tmp/transcribe_drive")
+    tmp_dir = Path(f"/tmp/transcribe_drive/{os.getpid()}")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     for i, f in enumerate(pending, 1):
@@ -563,6 +563,8 @@ def cmd_batch(args):
         except Exception as notify_err:
             print(f"  (notification failed: {notify_err})")
 
+    # Clean up pid-specific tmp dir
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # --- MAIN ---
