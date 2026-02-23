@@ -63,19 +63,29 @@ transcribe_drive transcribe <file_id> [--output-folder DRIVE_FOLDER_ID]
 # Batch transcribe all files in a folder
 transcribe_drive batch <folder_url_or_id> --output-folder DRIVE_FOLDER_ID [--budget DOLLARS]
 
+# Filter by filename (process only files matching a substring, case-insensitive)
+transcribe_drive batch <folder_url_or_id> --output-folder DRIVE_FOLDER_ID --filter "episode_01"
+
 # --- Dropbox ---
 
-# List video files in a Dropbox folder
+# List video files in a Dropbox folder (bare path or shared folder URL)
 transcribe_drive list /Videos --source dropbox
+transcribe_drive list "https://www.dropbox.com/scl/fo/..." --source dropbox
 
 # Transcribe a single file
 transcribe_drive transcribe /Videos/meeting.mov --source dropbox --output-folder /Output
 
 # Batch transcribe
 transcribe_drive batch /Videos --source dropbox --output-folder /Output --budget 5
+
+# Cross-provider: Dropbox source → Drive output
+transcribe_drive batch "https://www.dropbox.com/scl/fo/..." \
+  --source dropbox --output-folder DRIVE_FOLDER_ID --budget 20
 ```
 
-The `--source` flag accepts `drive` or `dropbox`. If omitted, the source is auto-detected from the URL/path (Drive URLs → drive, paths starting with `/` → dropbox, bare IDs → drive).
+The `--source` flag accepts `drive` or `dropbox`. If omitted, the source is auto-detected from the URL/path (Drive URLs → drive, Dropbox URLs or `/`-prefixed paths → dropbox, bare IDs → drive).
+
+**Output subfolders**: when `--output-folder` is set, the batch automatically creates a subfolder named after the source folder (e.g. `Season_6/`) inside the output root, with `transcripts/` and `audio/` subdirectories inside it. This keeps multiple batch runs to the same output root from colliding.
 
 ### Running a batch on a VM
 
@@ -115,7 +125,10 @@ The retry script:
 
 ### Audio extraction (two methods)
 
-1. **Streaming** (preferred, ~7x faster): ffmpeg reads video directly from Drive via HTTP using an OAuth bearer token, extracts only the audio track. No full video download needed.
+1. **Streaming** (preferred, ~7x faster): ffmpeg reads the video directly over HTTP, extracting only the audio track. No full video download needed.
+   - **Drive**: uses an OAuth bearer token in the request header
+   - **Dropbox (owned files)**: uses a short-lived temporary link (no auth header needed)
+   - **Dropbox (shared folder files)**: uses the `sharing/get_shared_link_file` content API endpoint with a bearer token — this endpoint supports `Accept-Ranges: bytes`, allowing ffmpeg to seek to the moov atom even for `.mov` files with metadata at the end
 
 2. **Full download** (fallback): Downloads the entire video file to disk, then runs ffmpeg locally. Used when streaming fails (e.g. Drive download quota exceeded).
 
