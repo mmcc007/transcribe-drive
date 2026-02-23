@@ -67,7 +67,7 @@ python3 -u transcribe_drive batch "$SOURCE_FOLDER" \
     2>&1 | tee -a "$LOGFILE"
 
 # Parse results
-successes=$(grep -c "Transcript uploaded to Drive" "$LOGFILE" 2>/dev/null || echo 0)
+successes=$(grep -c "Uploaded transcript:" "$LOGFILE" 2>/dev/null || echo 0)
 failures=$(grep -c "^  ERROR processing" "$LOGFILE" 2>/dev/null || echo 0)
 quota_errors=$(grep -c "downloadQuotaExceeded\|userRateLimitExceeded" "$LOGFILE" 2>/dev/null || echo 0)
 

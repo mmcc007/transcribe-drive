@@ -129,6 +129,11 @@ class DriveProvider:
 
         return files
 
+    def get_folder_name(self, service, folder_id: str) -> str:
+        """Return the Drive folder's display name."""
+        meta = service.files().get(fileId=folder_id, fields="name").execute()
+        return meta["name"]
+
     def list_existing_transcripts(self, service, folder_id: str) -> set[str]:
         """Return set of base names that already have transcripts."""
         query = (
