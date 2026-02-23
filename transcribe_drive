@@ -609,6 +609,8 @@ def cmd_batch(args):
         except Exception as notify_err:
             print(f"  (notification failed: {notify_err})")
 
+    # Clean up pid-specific tmp dir
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # --- MAIN ---
