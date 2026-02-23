@@ -455,6 +455,13 @@ def cmd_batch(args):
 
     print(f"Found {len(files)} video files")
 
+    # Apply --filter if specified
+    if getattr(args, "filter", None):
+        pattern = args.filter.lower()
+        before = len(files)
+        files = [f for f in files if pattern in f["name"].lower()]
+        print(f"Filter '{args.filter}': {before} → {len(files)} files")
+
     # Load manifest for skip logic (by source file ID)
     manifest = None
     manifest_file_id = None
@@ -642,6 +649,8 @@ def main():
                          help=source_help)
     p_batch.add_argument("--output-source", choices=["drive", "dropbox"], default=None,
                          help=output_source_help)
+    p_batch.add_argument("--filter", default=None,
+                         help="Only process files whose name contains this string (case-insensitive)")
 
     args = parser.parse_args()
 
