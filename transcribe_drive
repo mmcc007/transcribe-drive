@@ -489,6 +489,13 @@ def cmd_batch(args):
         files = [f for f in files if pattern in f["name"].lower()]
         print(f"Filter '{args.filter}': {before} → {len(files)} files")
 
+    # Apply --exclude if specified (repeatable)
+    if getattr(args, "exclude", None):
+        before = len(files)
+        for pattern in args.exclude:
+            files = [f for f in files if pattern.lower() not in f["name"].lower()]
+        print(f"Exclude {args.exclude}: {before} → {len(files)} files")
+
     # Load manifest for skip logic (by source file ID)
     manifest = None
     manifest_file_id = None
@@ -681,6 +688,8 @@ def main():
                          help=output_source_help)
     p_batch.add_argument("--filter", default=None,
                          help="Only process files whose name contains this string (case-insensitive)")
+    p_batch.add_argument("--exclude", action="append", default=None, metavar="PATTERN",
+                         help="Skip files whose name contains this string (case-insensitive, repeatable)")
 
     args = parser.parse_args()
 
