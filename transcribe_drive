@@ -189,6 +189,27 @@ def estimate_cost(duration_secs: float, output_tokens: int = 10000) -> float:
     return input_cost + output_cost
 
 
+def send_ntfy(title: str, body: str) -> None:
+    """Send a push notification via ntfy.sh (reads NTFY_TOPIC / NTFY_EMAIL from env)."""
+    import urllib.request
+    topic = os.environ.get("NTFY_TOPIC", "")
+    if not topic:
+        return
+    try:
+        headers = {"Title": title}
+        email = os.environ.get("NTFY_EMAIL", "")
+        if email:
+            headers["Email"] = email
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{topic}",
+            data=body.encode(),
+            headers=headers,
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"  (notification failed: {e})")
+
+
 def format_duration(seconds: float) -> str:
     """Format seconds as HH:MM:SS."""
     h = int(seconds // 3600)
@@ -497,6 +518,19 @@ def cmd_batch(args):
 
     print(f"\n{len(pending)} files to transcribe ({len(transcribed_ids)} already done)")
 
+    # Start notification
+    est_total = estimate_cost(3600) * len(pending)  # rough: ~1hr/file
+    budget_str = f"Budget: ${budget:.2f}" if budget else f"Est. cost: ~${est_total:.2f}"
+    total_size = sum(f.get("size", 0) for f in pending)
+    send_ntfy(
+        "Transcribe batch: STARTED",
+        "\n".join([
+            f"Files: {len(pending)} to process ({len(transcribed_ids)} already done)",
+            f"Size: {format_size(total_size)}",
+            budget_str,
+        ]),
+    )
+
     # Budget tracking
     total_cost = 0.0
     total_input_tokens = 0
@@ -590,30 +624,18 @@ def cmd_batch(args):
     if successes:
         avg_cost = total_cost / len(successes)
         print(f"  Avg cost/file: ${avg_cost:.3f}")
-    # Send notification via ntfy (set NTFY_TOPIC and optionally NTFY_EMAIL in env)
-    ntfy_topic = os.environ.get("NTFY_TOPIC", "")
-    ntfy_email = os.environ.get("NTFY_EMAIL", "")
-    if ntfy_topic:
-        try:
-            import urllib.request
-            status = "SUCCESS" if not failures else f"PARTIAL ({len(failures)} failures)"
-            if not successes and failures:
-                status = "FAILED (all files errored)"
-            parts = [f"Batch {status}", f"Processed: {len(successes)}/{len(pending)}", f"Cost: ${total_cost:.2f}", f"Duration: {format_duration(elapsed)}"]
-            if failures:
-                parts.append(f"Failed files: {len(failures)}")
-            msg = chr(10).join(parts)
-            headers = {"Title": f"Transcribe batch: {status}"}
-            if ntfy_email:
-                headers["Email"] = ntfy_email
-            req = urllib.request.Request(
-                f"https://ntfy.sh/{ntfy_topic}",
-                data=msg.encode(),
-                headers=headers,
-            )
-            urllib.request.urlopen(req, timeout=10)
-        except Exception as notify_err:
-            print(f"  (notification failed: {notify_err})")
+    # End notification
+    status = "SUCCESS" if not failures else f"PARTIAL ({len(failures)} failures)"
+    if not successes and failures:
+        status = "FAILED (all files errored)"
+    parts = [
+        f"Processed: {len(successes)}/{len(pending)}",
+        f"Cost: ${total_cost:.2f}",
+        f"Duration: {format_duration(elapsed)}",
+    ]
+    if failures:
+        parts.append(f"Failed: {', '.join(r['name'] for r in failures)}")
+    send_ntfy(f"Transcribe batch: {status}", "\n".join(parts))
 
     # Clean up pid-specific tmp dir
     shutil.rmtree(tmp_dir, ignore_errors=True)
