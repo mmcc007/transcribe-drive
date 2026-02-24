@@ -172,7 +172,13 @@ def transcribe_with_gemini(client, uploaded_file) -> tuple[str, dict]:
             "input_tokens": response.usage_metadata.prompt_token_count or 0,
             "output_tokens": response.usage_metadata.candidates_token_count or 0,
         }
-    return response.text, usage
+    text = response.text
+    if not text:
+        raise RuntimeError(
+            f"Gemini returned empty/None response "
+            f"(finish_reason: {response.candidates[0].finish_reason if response.candidates else 'no candidates'})"
+        )
+    return text, usage
 
 
 def estimate_cost(duration_secs: float, output_tokens: int = 10000) -> float:
