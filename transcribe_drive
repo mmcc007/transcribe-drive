@@ -452,8 +452,20 @@ def cmd_transcribe(args):
     return manifest_entry
 
 
+BATCH_PIDFILE = Path("/tmp/transcribe_drive_batch.pid")
+
+
 def cmd_batch(args):
     """Batch-transcribe all video files in a cloud folder."""
+    BATCH_PIDFILE.write_text(str(os.getpid()))
+    try:
+        _cmd_batch(args)
+    finally:
+        BATCH_PIDFILE.unlink(missing_ok=True)
+
+
+def _cmd_batch(args):
+    """Inner implementation of cmd_batch."""
     provider = resolve_provider(args)
     service = provider.connect()
     out_provider = resolve_output_provider(args)
