@@ -280,11 +280,13 @@ def process_single_file(provider, service, gemini, file_meta: dict,
                         output_folder_id: str | None,
                         tmp_dir: Path,
                         out_provider=None,
-                        out_service=None) -> tuple[dict, float, float, dict]:
+                        out_service=None,
+                        download_first: bool = False) -> tuple[dict, float, float, dict]:
     """Process one file: stream/download → transcribe → upload.
 
     out_provider/out_service are used for uploads; fall back to source
     provider/service if not specified (same-provider case).
+    download_first: skip streaming, download full video then extract locally.
 
     Returns (manifest_entry, actual_cost, duration, usage).
     """
@@ -302,14 +304,20 @@ def process_single_file(provider, service, gemini, file_meta: dict,
 
     try:
         # Stream or download + extract audio
-        try:
-            provider.stream_audio(service, file_id, audio_path)
-        except (PermissionError, RuntimeError) as stream_err:
-            print(f"  Stream failed: {stream_err}")
-            print(f"  Falling back to full download...")
+        if download_first:
+            print(f"  Downloading full file first (--download-first)...")
             provider.download_file(service, file_id, video_path)
             extract_audio(video_path, audio_path)
             video_path.unlink()
+        else:
+            try:
+                provider.stream_audio(service, file_id, audio_path)
+            except (PermissionError, RuntimeError) as stream_err:
+                print(f"  Stream failed: {stream_err}")
+                print(f"  Falling back to full download...")
+                provider.download_file(service, file_id, video_path)
+                extract_audio(video_path, audio_path)
+                video_path.unlink()
 
         duration = get_audio_duration(audio_path)
         est_cost = estimate_cost(duration)
@@ -448,6 +456,7 @@ def cmd_transcribe(args):
         provider, service, gemini, file_meta,
         transcript_folder_id, audio_folder_id, job_folder_id, tmp_dir,
         out_provider=out_provider, out_service=out_service,
+        download_first=getattr(args, "download_first", False),
     )
 
     # Update manifest in job subfolder
@@ -592,6 +601,7 @@ def _cmd_batch(args):
                 provider, service, gemini, f,
                 transcript_folder_id, audio_folder_id, job_folder_id, tmp_dir,
                 out_provider=out_provider, out_service=out_service,
+                download_first=getattr(args, "download_first", False),
             )
 
             total_cost += file_cost
@@ -704,6 +714,8 @@ def main():
     p_trans.add_argument("--output-folder", help="Output folder ID or path")
     p_trans.add_argument("--source", choices=["drive", "dropbox"], default=None,
                          help=source_help)
+    p_trans.add_argument("--download-first", action="store_true", default=False,
+                         help="Download full video before extracting audio (faster extraction, needs disk space)")
     p_trans.add_argument("--output-source", choices=["drive", "dropbox"], default=None,
                          help=output_source_help)
 
@@ -723,6 +735,8 @@ def main():
                          help="Skip files whose name contains this string (case-insensitive, repeatable)")
     p_batch.add_argument("--reprocess", action="append", default=None, metavar="PATTERN",
                          help="Remove matching files from manifest and re-transcribe them (repeatable)")
+    p_batch.add_argument("--download-first", action="store_true", default=False,
+                         help="Download full video before extracting audio (faster extraction, needs disk space)")
 
     args = parser.parse_args()
 
