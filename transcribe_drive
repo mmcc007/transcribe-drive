@@ -305,8 +305,11 @@ def process_single_file(provider, service, gemini, file_meta: dict,
     try:
         # Stream or download + extract audio
         if download_first:
-            print(f"  Downloading full file first (--download-first)...")
-            provider.download_file(service, file_id, video_path)
+            if video_path.exists():
+                print(f"  Using pre-downloaded file ({format_size(video_path.stat().st_size)})...")
+            else:
+                print(f"  Downloading full file (--download-first)...")
+                provider.download_file(service, file_id, video_path)
             extract_audio(video_path, audio_path)
             video_path.unlink()
         else:
@@ -590,18 +593,59 @@ def _cmd_batch(args):
     tmp_dir = Path("/tmp/transcribe_drive")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    download_first = getattr(args, "download_first", False)
+
+    # Prefetch state: when --download-first, download next file in background
+    # while processing the current one.
+    import threading
+    _prefetch_thread: threading.Thread | None = None
+    _prefetch_error: list[Exception] = []
+
+    def _start_prefetch(next_file: dict) -> None:
+        nonlocal _prefetch_thread, _prefetch_error
+        _prefetch_error = []
+        def _run():
+            try:
+                vp = tmp_dir / next_file["name"]
+                if not vp.exists():
+                    print(f"\n  [prefetch] Downloading {next_file['name']} in background...")
+                    provider.download_file(service, next_file["id"], vp)
+                    print(f"\n  [prefetch] {next_file['name']} ready.")
+            except Exception as e:
+                _prefetch_error.append(e)
+        _prefetch_thread = threading.Thread(target=_run, daemon=True)
+        _prefetch_thread.start()
+
+    def _wait_prefetch() -> None:
+        if _prefetch_thread and _prefetch_thread.is_alive():
+            print(f"  Waiting for background download to complete...")
+            _prefetch_thread.join()
+        if _prefetch_error:
+            raise RuntimeError(f"Prefetch download failed: {_prefetch_error[0]}")
+
+    # Kick off prefetch of the first file immediately if using download-first
+    if download_first and pending:
+        _start_prefetch(pending[0])
+
     for i, f in enumerate(pending, 1):
         name = f["name"]
         print(f"\n{'='*60}")
         print(f"[{i}/{len(pending)}] {name} ({format_size(f.get('size', 0))})")
         print(f"{'='*60}")
 
+        # Wait for this file's prefetch download before processing
+        if download_first:
+            _wait_prefetch()
+            # Start prefetching the next file
+            if i < len(pending):
+                _start_prefetch(pending[i])
+
         try:
             manifest_entry, file_cost, duration, usage = process_single_file(
                 provider, service, gemini, f,
                 transcript_folder_id, audio_folder_id, job_folder_id, tmp_dir,
                 out_provider=out_provider, out_service=out_service,
-                download_first=getattr(args, "download_first", False),
+                download_first=download_first,
             )
 
             total_cost += file_cost
@@ -647,8 +691,9 @@ def _cmd_batch(args):
                 print(f"  Stopping batch. {remaining} files remaining.")
                 break
 
-        # Delay between files to avoid rate limiting
-        if i < len(pending):
+        # Delay between files to avoid rate limiting (skip if prefetch running —
+        # the download already fills the gap)
+        if i < len(pending) and not download_first:
             delay = int(os.environ.get("TRANSCRIBE_DELAY", "45"))
             print(f"  Waiting {delay}s before next file...")
             time.sleep(delay)
