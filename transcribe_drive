@@ -314,6 +314,14 @@ def process_single_file(provider, service, gemini, file_meta: dict,
         duration = get_audio_duration(audio_path)
         est_cost = estimate_cost(duration)
         print(f"  Audio duration: {format_duration(duration)}")
+
+        # Sanity check: very short audio from a large file suggests a failed stream
+        file_size = file_meta.get("size", 0) or 0
+        if file_size > 5 * 1024 ** 3 and duration < 300:  # >5 GB file, <5 min audio
+            raise RuntimeError(
+                f"Suspiciously short audio ({format_duration(duration)}) from "
+                f"{format_size(file_size)} file — stream likely dropped. Re-run to retry."
+            )
         print(f"  Estimated cost: ${est_cost:.3f}")
 
         # Upload to Gemini and transcribe
@@ -519,6 +527,17 @@ def _cmd_batch(args):
         audio_folder_id = out_provider.ensure_subfolder(out_service, job_folder_id, "audio")
         manifest, manifest_file_id = out_provider.load_manifest(out_service, job_folder_id)
         manifest["source_folder_id"] = folder_ref
+        # Remove --reprocess targets from manifest so they get re-transcribed
+        reprocess = getattr(args, "reprocess", None) or []
+        if reprocess and manifest.get("files"):
+            before = len(manifest["files"])
+            manifest["files"] = [
+                e for e in manifest["files"]
+                if not any(pat.lower() in e.get("name", "").lower() for pat in reprocess)
+            ]
+            removed = before - len(manifest["files"])
+            if removed:
+                print(f"  Reprocess: removed {removed} manifest entries matching {reprocess}")
         transcribed_ids = {e["source_file_id"] for e in manifest.get("files", [])}
         if transcribed_ids:
             print(f"  Manifest loaded: {len(transcribed_ids)} files already transcribed")
@@ -702,6 +721,8 @@ def main():
                          help="Only process files whose name contains this string (case-insensitive)")
     p_batch.add_argument("--exclude", action="append", default=None, metavar="PATTERN",
                          help="Skip files whose name contains this string (case-insensitive, repeatable)")
+    p_batch.add_argument("--reprocess", action="append", default=None, metavar="PATTERN",
+                         help="Remove matching files from manifest and re-transcribe them (repeatable)")
 
     args = parser.parse_args()
 
