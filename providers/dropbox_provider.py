@@ -324,9 +324,38 @@ class DropboxProvider:
         print(f"  Audio extracted: {size_mb:.1f} MB (streamed)")
 
     def download_file(self, service, file_path: str, dest_path: Path) -> None:
-        """Download a Dropbox file to local disk."""
+        """Download a Dropbox file to local disk.
+
+        For owned files: uses files_download_to_file (fast, simple).
+        For shared folder files: uses the content API with Bearer token,
+        same endpoint as stream_audio, reading the full response to disk.
+        """
+        import urllib.request as _urlreq
+
         print(f"  Downloading {Path(file_path).name}...")
-        service.files_download_to_file(str(dest_path), file_path)
+
+        if self._shared_url:
+            # Shared folder file — must use content API with auth headers.
+            service.check_and_refresh_access_token()
+            token = service._oauth2_access_token
+            api_arg = json.dumps({"url": self._shared_url, "path": file_path})
+            api_url = "https://content.dropboxapi.com/2/sharing/get_shared_link_file"
+            req = _urlreq.Request(
+                api_url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Dropbox-API-Arg": api_arg,
+                },
+            )
+            with _urlreq.urlopen(req) as response, open(dest_path, "wb") as f:
+                while True:
+                    chunk = response.read(8 * 1024 * 1024)  # 8 MB chunks
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        else:
+            service.files_download_to_file(str(dest_path), file_path)
+
         print(
             f"  Downloaded: {dest_path.name}"
             f" ({dest_path.stat().st_size / 1e9:.1f} GB)"
