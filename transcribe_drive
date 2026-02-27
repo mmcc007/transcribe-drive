@@ -545,7 +545,7 @@ def _cmd_batch(args):
             before = len(manifest["files"])
             manifest["files"] = [
                 e for e in manifest["files"]
-                if not any(pat.lower() in e.get("name", "").lower() for pat in reprocess)
+                if not any(pat.lower() in e.get("source_file_name", e.get("name", "")).lower() for pat in reprocess)
             ]
             removed = before - len(manifest["files"])
             if removed:
